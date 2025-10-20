@@ -56,12 +56,9 @@ def fetch_segment(record, retries=3, backoff=2):
                      raise RequestException(f"Incomplete download. Expected {length} bytes, got {content_length}")
                 return resp.content
         except (ChunkedEncodingError, ConnectionError, ReadTimeout, RequestException) as e:
-            # 在并发模式下，直接打印可能会扰乱tqdm进度条，但对于调试很有用
-            # print(f"\nAttempt {attempt + 1} for {record['url']} failed: {e}") 
             if attempt < retries - 1:
                 time.sleep(backoff * (2 ** attempt)) # 指数退避
             else:
-                # 所有重试失败后，抛出异常
                 raise e
 
 
@@ -77,21 +74,11 @@ def process_record(record):
     """
     处理单个记录：下载、保存、处理异常。
     这是并发执行的工作单元。
-    返回一个元组 (status, url, message)
+    这个版本假设'skipped'检查已在主线程完成。
     """
-    url = record.get("url")
-    status = record.get("status")
-
-    # 跳过非200状态码的记录
-    if status != "200" or not url:
-        return ("skipped_status", url, f"Status was {status}")
-
+    url = record["url"]
     filename = safe_filename(url)
     output_path = os.path.join(OUTPUT_DIR, filename)
-
-    # 如果文件已存在，则跳过，实现断点续传
-    if os.path.exists(output_path):
-        return ("skipped_exists", url, "File already exists")
 
     try:
         # 下载原始的、可能被压缩的WARC字节数据
@@ -118,53 +105,69 @@ def main():
         print(f"错误: 输入文件 '{INPUT_JSONL}' 未找到。")
         return
         
-    total_records = len(lines)
-    print(f"共找到 {total_records} 条索引记录。使用 {MAX_WORKERS} 个线程开始并发下载...")
+    print(f"共找到 {len(lines)} 条索引记录。")
 
-    # 统计计数器
-    success_count = 0
+    # --- 优化点：预先扫描已存在的文件 ---
+    print("正在扫描输出目录以跳过已下载的文件...")
+    try:
+        # 使用集合(set)以获得 O(1) 的快速查找性能
+        existing_files = set(os.listdir(OUTPUT_DIR))
+        print(f"发现 {len(existing_files)} 个已存在的文件。")
+    except FileNotFoundError:
+        existing_files = set() # 目录可能在首次运行时不存在
+
+    # --- 在主线程中快速过滤记录 ---
+    records_to_process = []
     skipped_exists_count = 0
     skipped_status_count = 0
+    
+    for record in lines:
+        status = record.get("status")
+        url = record.get("url")
+
+        if status != "200" or not url:
+            skipped_status_count += 1
+            continue
+        
+        filename = safe_filename(url)
+        if filename in existing_files:
+            skipped_exists_count += 1
+            continue
+            
+        records_to_process.append(record)
+
+    total_to_download = len(records_to_process)
+    if total_to_download == 0:
+        print("\n所有文件均已下载或被跳过，无需执行任何操作。")
+    else:
+        print(f"将要下载 {total_to_download} 个新文件。使用 {MAX_WORKERS} 个线程开始并发下载...")
+
+    success_count = 0
     failed_count = 0
     
-    # 使用ThreadPoolExecutor进行并发下载
-    with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        # 提交所有任务
-        future_to_record = {executor.submit(process_record, record): record for record in lines}
-        
-        # 使用tqdm处理已完成的任务，提供实时进度
-        progress_bar = tqdm(concurrent.futures.as_completed(future_to_record), total=total_records, desc="下载进度")
-        
-        for future in progress_bar:
-            try:
-                status, url, message = future.result()
-                if status == "success":
-                    success_count += 1
-                elif status == "skipped_exists":
-                    skipped_exists_count += 1
-                elif status == "skipped_status":
-                    skipped_status_count += 1
-                elif status == "failed":
-                    failed_count += 1
-                
-                # 可以在进度条后显示统计信息
-                progress_bar.set_postfix(
-                    success=success_count, 
-                    skipped=skipped_exists_count + skipped_status_count, 
-                    failed=failed_count
-                )
+    # --- 仅将需要处理的记录提交给线程池 ---
+    if total_to_download > 0:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+            future_to_record = {executor.submit(process_record, record): record for record in records_to_process}
+            
+            progress_bar = tqdm(concurrent.futures.as_completed(future_to_record), total=total_to_download, desc="下载进度")
+            
+            for future in progress_bar:
+                try:
+                    status, _, _ = future.result()
+                    if status == "success":
+                        success_count += 1
+                    else: # status == "failed"
+                        failed_count += 1
+                    
+                    progress_bar.set_postfix(success=success_count, failed=failed_count)
 
-            except Exception as exc:
-                # 捕获工作函数本身可能抛出的意外异常
-                record = future_to_record[future]
-                url = record.get('url', 'unknown_url')
-                log_failure(url, f"executor_error: {exc}")
-                failed_count += 1
-                progress_bar.set_postfix(
-                    success=success_count, 
-                    skipped=skipped_exists_count + skipped_status_count, 
-                    failed=failed_count
-                )
+                except Exception as exc:
+                    record = future_to_record[future]
+                    url = record.get('url', 'unknown_url')
+                    log_failure(url, f"executor_error: {exc}")
+                    failed_count += 1
+                    progress_bar.set_postfix(success=success_count, failed=failed_count)
 
     print("\n✅ 下载完成！")
     print("========== 结果统计 ==========")
