@@ -15,7 +15,7 @@ OUTPUT_DIR = "guardian_batches"
 TASKS_FILE = "tasks.jsonl"
 COMPLETED_LOG_FILE = "completed_tasks.log"
 
-MAX_WORKERS = 10
+MAX_WORKERS = 30
 REQUEST_TIMEOUT = 120
 
 # ========== 下载函数 (无变动) ==========
@@ -59,6 +59,7 @@ def main_downloader():
     下载器主流程，具备断点续传和自动重试功能。
     【新】每个页面下载成功后立即保存为独立文件。
     【新】通过扫描已有文件和日志来判断完成状态，实现更强的鲁棒性。
+    【新】增加每轮下载的成功与失败计数。
     """
     print("===== 阶段 2: 执行下载 =====")
     
@@ -85,14 +86,12 @@ def main_downloader():
         for filename in os.listdir(OUTPUT_DIR):
             if filename.startswith("page_") and filename.endswith(".jsonl"):
                 filepath = os.path.join(OUTPUT_DIR, filename)
-                # 确保文件不是空的
                 if os.path.getsize(filepath) > 0:
-                    # 从文件名 'page_{index}_{page}.jsonl' 解析出 task_id
                     task_id = filename[5:-6] 
                     completed_tasks_ids.add(task_id)
     print(f"通过扫描文件，找到 {len(completed_tasks_ids)} 个已完成的任务。")
 
-    # 2. 从日志文件中补充已完成任务记录（作为补充和兼容）
+    # 2. 从日志文件中补充已完成任务记录
     if os.path.exists(COMPLETED_LOG_FILE):
         initial_count = len(completed_tasks_ids)
         with open(COMPLETED_LOG_FILE, 'r', encoding='utf-8') as f:
@@ -111,7 +110,7 @@ def main_downloader():
     print(f"共 {len(all_tasks)} 个任务，其中 {len(completed_tasks_ids)} 个已完成。")
     print(f"本轮需要下载 {len(tasks_to_do)} 个任务页。")
     
-    # --- 持久化下载循环 (此部分逻辑不变) ---
+    # --- 持久化下载循环 ---
     adapter = requests.adapters.HTTPAdapter(pool_connections=MAX_WORKERS, pool_maxsize=MAX_WORKERS)
     session = requests.Session()
     session.mount('https://', adapter)
@@ -125,6 +124,9 @@ def main_downloader():
             print(f"待处理页面数: {len(tasks_to_do)}")
             
             tasks_failed_this_run = []
+            # 【新增】本轮成功/失败计数器
+            success_this_run = 0
+            failures_this_run = 0
             
             with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
                 future_to_task = {executor.submit(fetch_page, session, task): task for task in tasks_to_do}
@@ -145,16 +147,25 @@ def main_downloader():
                                 for rec in result:
                                     f.write(json.dumps(rec, ensure_ascii=False) + "\n")
                             tasks_completed_this_batch.append(task_id)
-                            progress.set_postfix_str(f"已保存 {page_filename}")
+                            # 【修改】更新成功计数
+                            success_this_run += 1
                         except IOError:
                             tasks_failed_this_run.append(task_done)
-                            progress.set_postfix_str(f"文件保存失败: {page_filename}")
+                            # 【修改】更新失败计数
+                            failures_this_run += 1
                     else:
                         tasks_failed_this_run.append(task_done)
-                        progress.set_postfix_str(f"下载失败: {task_id}")
+                        # 【修改】更新失败计数
+                        failures_this_run += 1
+                    
+                    # 【修改】更新进度条后缀，显示实时计数
+                    progress.set_postfix_str(f"成功: {success_this_run}, 失败: {failures_this_run}")
             
+            # 【新增】打印本轮的总结
+            print(f"\n本轮结果: {success_this_run} 个成功, {failures_this_run} 个失败。")
+
             if tasks_completed_this_batch:
-                print(f"本轮成功 {len(tasks_completed_this_batch)} 页，正在记录进度...")
+                print(f"正在记录 {len(tasks_completed_this_batch)} 个成功任务的进度...")
                 for task_id in tasks_completed_this_batch:
                     log_file.write(task_id + "\n")
                 log_file.flush()
@@ -218,7 +229,6 @@ def main_merge_and_deduplicate():
         print(f"输出目录 {OUTPUT_DIR} 不存在，无法合并。")
         return
         
-    # 读取所有 .jsonl 文件，不论其前缀是什么
     batch_files = [f for f in os.listdir(OUTPUT_DIR) if f.endswith(".jsonl")]
     if not batch_files:
         print(f"在输出目录 '{OUTPUT_DIR}' 中没有找到任何 .jsonl 文件，无法合并。")
