@@ -15,7 +15,7 @@ OUTPUT_DIR = "guardian_batches"
 TASKS_FILE = "tasks.jsonl"
 COMPLETED_LOG_FILE = "completed_tasks.log"
 
-MAX_WORKERS = 30
+MAX_WORKERS = 10
 REQUEST_TIMEOUT = 120
 
 # ========== 下载函数 (无变动) ==========
