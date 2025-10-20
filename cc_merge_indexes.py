@@ -12,19 +12,19 @@ DOMAIN = "theguardian.com/*"
 OUTPUT = "guardian_index_merged.jsonl"
 OUTPUT_DIR = "guardian_batches"
 INDEXES = ['CC-MAIN-2025-38', 'CC-MAIN-2025-33', 'CC-MAIN-2025-30', 'CC-MAIN-2025-26', 'CC-MAIN-2025-21', 'CC-MAIN-2025-18', 'CC-MAIN-2025-13', 'CC-MAIN-2025-08', 'CC-MAIN-2025-05', 'CC-MAIN-2024-51', 'CC-MAIN-2024-46', 'CC-MAIN-2024-42', 'CC-MAIN-2024-38', 'CC-MAIN-2024-33', 'CC-MAIN-2024-30', 'CC-MAIN-2024-26', 'CC-MAIN-2024-22', 'CC-MAIN-2024-18', 'CC-MAIN-2024-10', 'CC-MAIN-2023-50', 'CC-MAIN-2023-40', 'CC-MAIN-2023-23', 'CC-MAIN-2023-14', 'CC-MAIN-2023-06', 'CC-MAIN-2022-49', 'CC-MAIN-2022-40', 'CC-MAIN-2022-33', 'CC-MAIN-2022-27', 'CC-MAIN-2022-21', 'CC-MAIN-2022-05', 'CC-MAIN-2021-49', 'CC-MAIN-2021-43', 'CC-MAIN-2021-39', 'CC-MAIN-2021-31', 'CC-MAIN-2021-25', 'CC-MAIN-2021-21', 'CC-MAIN-2021-17', 'CC-MAIN-2021-10', 'CC-MAIN-2021-04', 'CC-MAIN-2020-50', 'CC-MAIN-2020-45', 'CC-MAIN-2020-40', 'CC-MAIN-2020-34', 'CC-MAIN-2020-29', 'CC-MAIN-2020-24', 'CC-MAIN-2020-16', 'CC-MAIN-2020-10', 'CC-MAIN-2020-05', 'CC-MAIN-2019-51', 'CC-MAIN-2019-47', 'CC-MAIN-2019-43', 'CC-MAIN-2019-39', 'CC-MAIN-2019-35', 'CC-MAIN-2019-30', 'CC-MAIN-2019-26', 'CC-MAIN-2019-22', 'CC-MAIN-2019-18', 'CC-MAIN-2019-13', 'CC-MAIN-2019-09', 'CC-MAIN-2019-04', 'CC-MAIN-2018-51', 'CC-MAIN-2018-47', 'CC-MAIN-2018-43', 'CC-MAIN-2018-39', 'CC-MAIN-2018-34', 'CC-MAIN-2018-30', 'CC-MAIN-2018-26', 'CC-MAIN-2018-22', 'CC-MAIN-2018-17', 'CC-MAIN-2018-13', 'CC-MAIN-2018-09', 'CC-MAIN-2018-05', 'CC-MAIN-2017-51', 'CC-MAIN-2017-47', 'CC-MAIN-2017-43', 'CC-MAIN-2017-39', 'CC-MAIN-2017-34', 'CC-MAIN-2017-30', 'CC-MAIN-2017-26', 'CC-MAIN-2017-22', 'CC-MAIN-2017-17', 'CC-MAIN-2017-13', 'CC-MAIN-2017-09', 'CC-MAIN-2017-04', 'CC-MAIN-2016-50', 'CC-MAIN-2016-44', 'CC-MAIN-2016-40', 'CC-MAIN-2016-36', 'CC-MAIN-2016-30', 'CC-MAIN-2016-26', 'CC-MAIN-2016-22', 'CC-MAIN-2016-18', 'CC-MAIN-2016-07', 'CC-MAIN-2015-48', 'CC-MAIN-2015-40', 'CC-MAIN-2015-35', 'CC-MAIN-2015-32', 'CC-MAIN-2015-27', 'CC-MAIN-2015-22', 'CC-MAIN-2015-18', 'CC-MAIN-2015-14', 'CC-MAIN-2015-11', 'CC-MAIN-2015-06', 'CC-MAIN-2014-52', 'CC-MAIN-2014-49', 'CC-MAIN-2014-42', 'CC-MAIN-2014-41', 'CC-MAIN-2014-35', 'CC-MAIN-2014-23', 'CC-MAIN-2014-15', 'CC-MAIN-2014-10', 'CC-MAIN-2013-48', 'CC-MAIN-2013-20', 'CC-MAIN-2012', 'CC-MAIN-2009-2010', 'CC-MAIN-2008-2009']
-MAX_WORKERS = 3  # <--- NEW: Number of parallel download threads
+MAX_WORKERS = 130  # <--- NEW: Number of parallel download threads
 
 # ========== 函数部分 ==========
 
 # NEW: Create a dedicated function to fetch a single page. This will be run in a thread.
-def fetch_page(page_url, page_num, retries=20, backoff=3):
+def fetch_page(page_url, page_num, retries=50, backoff=3):
     """
     Fetches a single page of results from the Common Crawl Index.
     Returns a list of records on success, or None on failure.
     """
     for attempt in range(1, retries + 1):
         try:
-            with requests.get(page_url, stream=True, timeout=120) as resp:
+            with requests.get(page_url, stream=True, timeout=600) as resp:
                 if resp.status_code == 200:
                     lines = []
                     for line in resp.iter_lines():
@@ -51,7 +51,7 @@ def fetch_page(page_url, page_num, retries=20, backoff=3):
     return None # Should not be reached, but as a fallback
 
 # MODIFIED: The main function now orchestrates the parallel fetching of pages.
-def fetch_from_index(index_name, domain, retries=20, backoff=3):
+def fetch_from_index(index_name, domain, retries=50, backoff=3):
     """
     从 Common Crawl Index 并行查询指定域名的记录。
     如果任何一个分页下载失败，则整个索引的下载任务失败，返回空列表。
@@ -63,7 +63,7 @@ def fetch_from_index(index_name, domain, retries=20, backoff=3):
     try:
         page_check_url = f"{base_url}&showNumPages=true"
         print(f"正在查询 {index_name} 的总页数...")
-        resp = requests.get(page_check_url, timeout=60)
+        resp = requests.get(page_check_url, timeout=600)
         if resp.status_code == 200:
             page_info = json.loads(resp.text.strip().splitlines()[0])
             num_pages = page_info.get("pages", 1)
