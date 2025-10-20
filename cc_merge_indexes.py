@@ -16,6 +16,7 @@ INDEXES = ['CC-MAIN-2025-38', 'CC-MAIN-2025-33', 'CC-MAIN-2025-30', 'CC-MAIN-202
 def fetch_from_index(index_name, domain, retries=5, backoff=3):
     """
     从 Common Crawl Index 查询指定域名的记录，带自动重试与分页功能。
+    如果任何一个分页下载失败，则整个索引的下载任务失败，返回空列表。
     """
     base_url = f"https://index.commoncrawl.org/{index_name}-index?url={domain}&output=json"
     
@@ -26,7 +27,6 @@ def fetch_from_index(index_name, domain, retries=5, backoff=3):
         print(f"正在查询 {index_name} 的总页数...")
         resp = requests.get(page_check_url, timeout=60)
         if resp.status_code == 200:
-            # API返回的第一行是页数信息，例如 {"pages": 10, "pageSize": 10000}
             page_info = json.loads(resp.text.strip().splitlines()[0])
             num_pages = page_info.get("pages", 1)
             print(f"  -> {index_name} 共有 {num_pages} 页")
@@ -57,7 +57,8 @@ def fetch_from_index(index_name, domain, retries=5, backoff=3):
                     else:
                         print(f"❌ 访问 {index_name} (页 {page}) 失败: HTTP {resp.status_code}")
                         if attempt == retries: # 如果是最后一次尝试
-                             return all_records # 返回已抓取的部分
+                             print(f"❌ 索引 {index_name} 下载失败（页面 {page} 多次尝试后仍失败）。")
+                             return [] # 【修改点】返回空列表，表示整体失败
                         time.sleep(backoff * attempt)
 
             except (ChunkedEncodingError, ConnectionError, ReadTimeout) as e:
@@ -66,13 +67,13 @@ def fetch_from_index(index_name, domain, retries=5, backoff=3):
                     wait = backoff * attempt
                     time.sleep(wait)
                 else:
-                    print(f"❌ 放弃 {index_name} (页 {page})（多次失败）")
-                    # 即使单页失败，也继续处理下一页，并返回已有的记录
-                    break
+                    print(f"❌ 放弃 {index_name} (页 {page})（多次网络失败）")
+                    print(f"❌ 索引 {index_name} 下载失败（页面 {page} 多次尝试后仍失败）。")
+                    return [] # 【修改点】返回空列表，表示整体失败
         
         time.sleep(0.5) # 对API友好，每次请求后稍作停顿
 
-    return all_records
+    return all_records # 只有当所有页面都成功时，才会返回完整记录
 
 
 # ========== 主流程 ==========
@@ -86,6 +87,14 @@ for idx in INDEXES:
 
     print(f"\n===== 开始处理索引: {idx} =====")
     recs = fetch_from_index(idx, DOMAIN)
+    
+    if not recs:
+        # 如果返回的是空列表，说明下载失败
+        print(f"❌ {idx} 未抓取到任何记录或下载失败，跳过保存。")
+        # 创建一个空文件以标记尝试过，避免下次重复失败
+        open(batch_path, 'w').close()
+        continue
+
     print(f"  -> {idx} 共抓取 {len(recs)} 条记录")
 
     with open(batch_path, "w", encoding="utf-8") as f:
@@ -111,7 +120,7 @@ for fname in tqdm(os.listdir(OUTPUT_DIR), desc="加载批次"):
 print(f"共加载 {len(all_records)} 条记录，正在去重...")
 
 # ========== 去重 ==========
-# (去重逻辑保持不变，它设计得很好)
+# (去重逻辑保持不变)
 from urllib.parse import urlparse
 
 def normalize_url(url: str) -> str:
