@@ -1,4 +1,4 @@
-# 3_extract_structured_data_chunked.py
+# 4_extract_parallel.py
 import os
 import re
 import io
@@ -8,36 +8,30 @@ import glob
 from tqdm import tqdm
 from charset_normalizer import from_bytes
 from bs4 import BeautifulSoup
-from typing import Dict, Optional, Set
+from typing import Dict, Optional, Tuple, List
+from multiprocessing import Pool, cpu_count
 
 # ========== 配置 ==========
-# 输入：存放原始WARC片段的目录
 INPUT_DIR = "guardian_world_warc_segments"
-# 输出：存放提取出的结构化数据文件的目录
 OUTPUT_DATA_DIR = "guardian_world_structured_data"
-# 日志：记录解析或提取失败的文件
 LOG_FILE = "extraction_failed.log"
-# 分块大小：每处理多少个文件，就创建一个新的输出文件
 FILES_PER_CHUNK = 10000
+# 使用所有可用的CPU核心数减一，留一个给系统，或者直接用 cpu_count()
+NUM_PROCESSES = max(1, cpu_count() - 1) 
 
 # 创建输出目录
 os.makedirs(OUTPUT_DATA_DIR, exist_ok=True)
 
 
-# ========== 工具函数 ==========
-
-def maybe_decompress(warc_bytes: bytes) -> bytes:
-    """尝试解压 gzip 数据，如果失败则原样返回"""
-    try:
-        with gzip.GzipFile(fileobj=io.BytesIO(warc_bytes)) as f:
-            return f.read()
-    except (OSError, gzip.BadGzipFile):
-        return warc_bytes
-
+# ========== 解析函数 (将在子进程中运行) ==========
 
 def extract_html_from_warc(warc_bytes: bytes) -> str:
-    """从WARC响应中提取HTML正文，并自动检测和转换编码。"""
-    raw_bytes = maybe_decompress(warc_bytes)
+    # ... (此函数无需更改)
+    try:
+        raw_bytes = gzip.decompress(warc_bytes)
+    except (OSError, gzip.BadGzipFile):
+        raw_bytes = warc_bytes
+        
     header_end = raw_bytes.find(b'\r\n\r\n')
     if header_end == -1: return raw_bytes.decode('utf-8', errors='ignore')
     http_header_end = raw_bytes.find(b'\r\n\r\n', header_end + 4)
@@ -57,25 +51,18 @@ def extract_html_from_warc(warc_bytes: bytes) -> str:
     return str(result) if result else body_bytes.decode('utf-8', errors='ignore')
 
 def extract_article_data(html: str) -> Dict[str, Optional[str]]:
-    """
-    使用BeautifulSoup从HTML中提取结构化数据（标题、发布时间、作者、正文）。
-    这是针对 The Guardian 网站优化的选择器。
-    """
-    soup = BeautifulSoup(html, 'html.parser')
+    # 关键优化：使用 'lxml' 解析器
+    soup = BeautifulSoup(html, 'lxml')
     
-    # 1. 提取标题
     title_tag = soup.find('h1', class_=re.compile(r'content__headline'))
     title = title_tag.get_text(strip=True) if title_tag else None
 
-    # 2. 提取发布时间 (寻找<time>标签及其datetime属性)
     time_tag = soup.find('time', attrs={'itemprop': 'datePublished'})
     publish_time = time_tag['datetime'] if time_tag and 'datetime' in time_tag.attrs else None
 
-    # 3. 提取作者
     author_tag = soup.find('a', attrs={'rel': 'author'})
     author = author_tag.get_text(strip=True) if author_tag else None
 
-    # 4. 提取文章正文
     article_body_tag = soup.find('div', attrs={'itemprop': 'articleBody'})
     if not article_body_tag:
         article_body_tag = soup.find('div', class_=re.compile(r'content__article-body'))
@@ -86,24 +73,42 @@ def extract_article_data(html: str) -> Dict[str, Optional[str]]:
             element.decompose()
         text = article_body_tag.get_text(separator='\n', strip=True)
     
-    return {
-        "title": title,
-        "publish_time": publish_time,
-        "author": author,
-        "text": text,
-    }
+    return {"title": title, "publish_time": publish_time, "author": author, "text": text}
 
-def log_failure(filename: str, reason: str):
-    """记录失败的文件和原因"""
-    with open(LOG_FILE, "a", encoding="utf-8") as f:
-        f.write(f"{filename}\t{reason}\n")
+def process_single_file(filename: str) -> Optional[Dict]:
+    """
+    处理单个文件的完整流程：读取、解析、提取。
+    这个函数会被分发到多个进程中并行执行。
+    """
+    try:
+        base_name = os.path.splitext(os.path.splitext(filename)[0])[0]
+        input_path = os.path.join(INPUT_DIR, filename)
 
-def load_processed_ids(dir_path: str) -> Set[str]:
-    """
-    扫描输出目录中的所有.jsonl文件，加载已经处理过的记录ID。
-    """
+        with open(input_path, "rb") as f:
+            warc_bytes = f.read()
+
+        html_content = extract_html_from_warc(warc_bytes)
+        if not html_content or not html_content.strip():
+            raise ValueError("Extracted HTML is empty.")
+        
+        article_data = extract_article_data(html_content)
+        if not article_data.get("text") or not article_data["text"].strip():
+            raise ValueError("Extracted article text is empty.")
+        
+        # 返回包含ID和提取数据的完整记录
+        return {"id": base_name, **article_data}
+
+    except Exception as e:
+        # 在并行模式下，直接打印错误或返回特定标识符
+        # 写入日志文件由主进程完成，避免竞争
+        # print(f"Error processing {filename}: {e}")
+        return {"_error": True, "filename": filename, "reason": f"{type(e).__name__}: {str(e)}"}
+
+
+# ========== 主进程逻辑 ==========
+
+def load_processed_ids(dir_path: str) -> set:
     processed_ids = set()
-    # 使用glob查找所有jsonl文件
     for filepath in glob.glob(os.path.join(dir_path, "*.jsonl")):
         try:
             with open(filepath, "r", encoding="utf-8") as f:
@@ -112,11 +117,9 @@ def load_processed_ids(dir_path: str) -> Set[str]:
                         record = json.loads(line)
                         if 'id' in record:
                             processed_ids.add(record['id'])
-        except (json.JSONDecodeError, IOError) as e:
-            print(f"警告: 读取 {filepath} 时出错，已跳过: {e}")
+        except (json.JSONDecodeError, IOError): pass
     return processed_ids
 
-# ========== 主逻辑 ==========
 def main():
     if not os.path.exists(INPUT_DIR):
         print(f"错误: 输入目录 '{INPUT_DIR}' 不存在。")
@@ -127,88 +130,64 @@ def main():
         print(f"已找到 {len(processed_ids)} 个已处理的记录，将跳过它们。")
 
     all_warc_files = sorted([f for f in os.listdir(INPUT_DIR) if f.endswith('.warc.gz')])
-    
-    # 过滤掉已处理的文件
-    files_to_process = []
-    for f in all_warc_files:
-        base_name = os.path.splitext(os.path.splitext(f)[0])[0]
-        if base_name not in processed_ids:
-            files_to_process.append(f)
+    files_to_process = [
+        f for f in all_warc_files 
+        if os.path.splitext(os.path.splitext(f)[0])[0] not in processed_ids
+    ]
             
     if not files_to_process:
         print("所有文件均已处理。程序退出。")
         return
 
     print(f"总共找到 {len(all_warc_files)} 个WARC文件，需处理 {len(files_to_process)} 个。")
+    print(f"启动 {NUM_PROCESSES} 个并行进程进行处理...")
 
-    output_file_handle = None
-    chunk_index = 1
-    # 确定起始的chunk index
-    existing_chunks = glob.glob(os.path.join(OUTPUT_DATA_DIR, "data_*.jsonl"))
-    if existing_chunks:
-        chunk_index = len(existing_chunks)
-        # 假设最后一个文件可能未写满，我们继续向其追加
-        last_chunk_path = os.path.join(OUTPUT_DATA_DIR, f"data_{chunk_index:05d}.jsonl")
-        if os.path.exists(last_chunk_path):
-             with open(last_chunk_path, 'r') as f:
-                 lines_in_last_chunk = sum(1 for line in f)
-             if lines_in_last_chunk < FILES_PER_CHUNK:
-                 print(f"继续向未写满的文件 {last_chunk_path} 追加...")
-             else:
-                 chunk_index += 1 # 最后一个文件满了，开一个新的
-        else: # 如果文件序号不连续，就从最大的下一个开始
-            chunk_index = max([int(re.search(r'data_(\d+).jsonl', p).group(1)) for p in existing_chunks]) + 1
+    # 使用 multiprocessing.Pool 来并行处理文件
+    with Pool(processes=NUM_PROCESSES) as pool:
+        # 使用 imap_unordered 来获得最佳性能，它会按完成顺序返回结果
+        results_iterator = pool.imap_unordered(process_single_file, files_to_process)
+        
+        # 使用 tqdm 显示进度
+        pbar = tqdm(total=len(files_to_process), desc="处理进度")
+        
+        # --- 分块写入逻辑 ---
+        output_file_handle = None
+        records_in_current_chunk = 0
+        chunk_index = len(glob.glob(os.path.join(OUTPUT_DATA_DIR, "data_*.jsonl"))) + 1
+        log_f = open(LOG_FILE, "a", encoding="utf-8")
 
-
-    files_in_current_chunk = 0
-
-    try:
-        for filename in tqdm(files_to_process, desc="处理进度"):
-            # --- 分块逻辑 ---
-            if output_file_handle is None or files_in_current_chunk >= FILES_PER_CHUNK:
-                if output_file_handle:
-                    output_file_handle.close()
+        try:
+            for result in results_iterator:
+                if result:
+                    if result.get("_error"):
+                        # 记录失败
+                        log_f.write(f"{result['filename']}\t{result['reason']}\n")
+                    else:
+                        # 检查是否需要开启新文件块
+                        if output_file_handle is None or records_in_current_chunk >= FILES_PER_CHUNK:
+                            if output_file_handle:
+                                output_file_handle.close()
+                            
+                            output_path = os.path.join(OUTPUT_DATA_DIR, f"data_{chunk_index:05d}.jsonl")
+                            output_file_handle = open(output_path, "a", encoding="utf-8")
+                            chunk_index += 1
+                            records_in_current_chunk = 0
+                        
+                        # 写入成功的结果
+                        output_file_handle.write(json.dumps(result, ensure_ascii=False) + '\n')
+                        records_in_current_chunk += 1
                 
-                output_path = os.path.join(OUTPUT_DATA_DIR, f"data_{chunk_index:05d}.jsonl")
-                print(f"\n创建新的输出块: {output_path}")
-                output_file_handle = open(output_path, "a", encoding="utf-8")
-                chunk_index += 1
-                files_in_current_chunk = 0
-            
-            # --- 提取逻辑 ---
-            base_name = os.path.splitext(os.path.splitext(filename)[0])[0]
-            input_path = os.path.join(INPUT_DIR, filename)
-            
-            try:
-                with open(input_path, "rb") as f:
-                    warc_bytes = f.read()
-
-                html_content = extract_html_from_warc(warc_bytes)
-                if not html_content or not html_content.strip():
-                    raise ValueError("Extracted HTML is empty.")
-                
-                article_data = extract_article_data(html_content)
-                if not article_data.get("text") or not article_data["text"].strip():
-                    raise ValueError("Extracted article text is empty.")
-
-                # 合并ID和提取的数据
-                final_record = {"id": base_name, **article_data}
-                
-                # 写入JSONL文件
-                output_file_handle.write(json.dumps(final_record, ensure_ascii=False) + '\n')
-                files_in_current_chunk += 1
-
-            except Exception as e:
-                log_failure(filename, f"{type(e).__name__}: {str(e)}")
-    finally:
-        # 确保循环结束后，最后打开的文件被关闭
-        if output_file_handle and not output_file_handle.closed:
-            output_file_handle.close()
+                # 更新进度条
+                pbar.update(1)
+        finally:
+            pbar.close()
+            if output_file_handle:
+                output_file_handle.close()
+            log_f.close()
 
     print(f"\n✅ 结构化数据提取完成！")
     print(f"数据块已保存到目录: '{OUTPUT_DATA_DIR}'")
     print(f"失败记录已写入: '{LOG_FILE}'")
-
 
 if __name__ == "__main__":
     main()
