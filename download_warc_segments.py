@@ -1,4 +1,4 @@
-# download_warc.py (v4 - True Streaming & Memory Efficient)
+# download_warc.py (v5 - 精确目录控制 & True Streaming)
 import os
 import json
 import hashlib
@@ -9,7 +9,7 @@ import concurrent.futures
 from tqdm import tqdm
 from requests.exceptions import RequestException, ChunkedEncodingError, ConnectionError, ReadTimeout
 
-# ========== 配置 ==========
+# ========== 配置 (无变化) ==========
 INPUT_JSONL = "/Volumes/T7/cc/guardian_index/guardian_index_200_only.jsonl"
 OUTPUT_DIR = "/Volumes/T7/cc/guardian_warc_segments"
 LOG_FILE = "/Volumes/T7/cc/guardian_warc_segments/download_failed.log"
@@ -17,10 +17,6 @@ SUCCESS_LOG = "/Volumes/T7/cc/guardian_warc_segments/download_success.log"
 BASE_URL = "https://data.commoncrawl.org/"
 MAX_WORKERS = 64
 MAX_FILES_PER_DIR = 5000
-
-# <<< 新增配置：控制内存中的任务队列大小 >>>
-# 限制同时在内存中排队的任务数量，防止无限增长。
-# 一个好的经验值是最大工作线程数的几倍。
 MAX_FUTURES_IN_FLIGHT = MAX_WORKERS * 4
 
 os.makedirs(OUTPUT_DIR, exist_ok=True)
@@ -28,13 +24,19 @@ os.makedirs(OUTPUT_DIR, exist_ok=True)
 # ========== 线程锁 (无变化) ==========
 fail_log_lock = threading.Lock()
 success_log_lock = threading.Lock()
+# <<< 新增线程锁：用于控制 get_target_directory 的并发访问 >>>
+# 虽然 os.makedirs(exist_ok=True) 是线程安全的，但为了防止多个线程在同一瞬间
+# 都发现某个目录满了并尝试创建下一个目录，加锁可以保证目录序号的严格递增。
+# 这是一个更稳健的做法。
+dir_check_lock = threading.Lock()
 
-# ========== 工具函数 (无变化) ==========
+# ========== 工具函数 (get_target_directory 增加锁) ==========
 def safe_filename(url: str) -> str:
     h = hashlib.md5(url.encode()).hexdigest()
     return f"{h}.warc.gz"
 
 def fetch_segment(record, retries=3, backoff=2):
+    # ... (此函数无变化) ...
     warc_path = record["filename"]
     offset = int(record["offset"])
     length = int(record["length"])
@@ -55,6 +57,7 @@ def fetch_segment(record, retries=3, backoff=2):
             else:
                 raise e
 
+
 def log_failure(url, reason):
     with fail_log_lock:
         with open(LOG_FILE, "a", encoding="utf-8") as f:
@@ -66,35 +69,53 @@ def log_success(filename_hash: str):
             f.write(f"{filename_hash}\n")
 
 def get_target_directory(base_dir: str) -> str:
-    # ... (此函数无变化) ...
-    try:
-        subdirs = [d for d in os.listdir(base_dir) if os.path.isdir(os.path.join(base_dir, d)) and d.startswith("batch_")]
-    except FileNotFoundError:
-        subdirs = []
-    if not subdirs:
-        target_dir = os.path.join(base_dir, "batch_0000")
-    else:
-        latest_dir_name = sorted(subdirs)[-1]
-        latest_dir_path = os.path.join(base_dir, latest_dir_name)
+    """
+    获取当前应该用于保存文件的目录。
+    这个函数现在是线程安全的，并且每次调用都会检查最新的目录状态。
+    """
+    with dir_check_lock: # <<< 修改：增加锁来保证操作的原子性
         try:
-            num_files = len([f for f in os.listdir(latest_dir_path) if not f.startswith('.')])
+            subdirs = [d for d in os.listdir(base_dir) if os.path.isdir(os.path.join(base_dir, d)) and d.startswith("batch_")]
         except FileNotFoundError:
-            num_files = 0
-        if num_files >= MAX_FILES_PER_DIR:
-            latest_batch_num = int(latest_dir_name.split('_')[-1])
-            new_batch_num = latest_batch_num + 1
-            target_dir = os.path.join(base_dir, f"batch_{new_batch_num:04d}")
+            subdirs = []
+
+        if not subdirs:
+            target_dir = os.path.join(base_dir, "batch_0000")
         else:
-            target_dir = latest_dir_path
-    os.makedirs(target_dir, exist_ok=True)
-    return target_dir
+            latest_dir_name = sorted(subdirs)[-1]
+            latest_dir_path = os.path.join(base_dir, latest_dir_name)
+            try:
+                # 统计实际文件数，排除隐藏文件
+                num_files = len([f for f in os.listdir(latest_dir_path) if not f.startswith('.')])
+            except FileNotFoundError:
+                num_files = 0
+
+            if num_files >= MAX_FILES_PER_DIR:
+                latest_batch_num = int(latest_dir_name.split('_')[-1])
+                new_batch_num = latest_batch_num + 1
+                target_dir = os.path.join(base_dir, f"batch_{new_batch_num:04d}")
+            else:
+                target_dir = latest_dir_path
+
+        os.makedirs(target_dir, exist_ok=True)
+        return target_dir
 
 
-# ========== 主逻辑 (无变化) ==========
-def process_record(record, target_dir):
+# ========== 主逻辑 (核心修改) ==========
+
+# <<< 核心修改 1：修改 process_record 函数 >>>
+def process_record(record, base_output_dir):
+    """
+    处理单个记录，函数内部动态决定存储目录。
+    """
     url = record["url"]
     filename = safe_filename(url)
+    
+    # 在保存文件前，动态获取当前正确的目标目录
+    target_dir = get_target_directory(base_output_dir)
+    
     output_path = os.path.join(target_dir, filename)
+
     try:
         warc_bytes = fetch_segment(record)
         with open(output_path, "wb") as f:
@@ -106,12 +127,8 @@ def process_record(record, target_dir):
         log_failure(url, error_message)
         return ("failed", url, error_message)
 
-# <<< 关键修改：将文件读取和过滤逻辑封装成一个生成器 >>>
 def generate_tasks(input_file, completed_hashes):
-    """
-    流式读取输入文件，跳过已完成的任务，并逐一产出（yield）需要处理的记录。
-    这个函数不会将所有记录加载到内存中。
-    """
+    # ... (此函数无变化) ...
     try:
         with open(input_file, "r", encoding="utf-8") as f:
             for line in f:
@@ -119,18 +136,17 @@ def generate_tasks(input_file, completed_hashes):
                     record = json.loads(line)
                     filename = safe_filename(record["url"])
                     if filename in completed_hashes:
-                        continue # 直接跳到下一行
+                        continue
                     yield record
                 except (json.JSONDecodeError, KeyError):
-                    # 跳过格式错误的行
                     continue
     except FileNotFoundError:
         print(f"错误: 输入文件 '{input_file}' 未找到。")
-        print("请先运行 filter_jsonl.py 脚本生成此文件。")
-        return # 结束生成器
+        return
+
 
 def main():
-    # --- 1. 加载已完成记录 (这部分仍然需要加载到内存中，但通常是可控的) ---
+    # --- 1. 加载已完成记录 (无变化) ---
     print("正在加载已完成的下载记录...")
     completed_hashes = set()
     try:
@@ -140,7 +156,7 @@ def main():
     except FileNotFoundError:
         print(f"成功日志 '{SUCCESS_LOG}' 未找到，将自动创建。")
 
-    # --- 2. 预先计算总任务数，以便显示准确的进度条 (快速扫描，低内存) ---
+    # --- 2. 预先计算总任务数 (无变化) ---
     print("正在扫描索引文件以计算任务总数...")
     total_records_in_file = 0
     total_to_download = 0
@@ -149,7 +165,6 @@ def main():
             for line in f:
                 total_records_in_file += 1
                 try:
-                    # 只解析URL来检查是否已完成，比 json.loads(line) 更快
                     url = json.loads(line).get("url")
                     if url and safe_filename(url) not in completed_hashes:
                         total_to_download += 1
@@ -167,48 +182,43 @@ def main():
         print("\n所有文件均已下载，无需执行任何操作。")
         return
 
-    # --- 3. <<< 核心修改：流式处理和并发提交 >>> ---
-    target_dir = get_target_directory(OUTPUT_DIR)
+    # --- 3. 流式处理和并发提交 (核心修改) ---
+    # <<< 核心修改 2：不再预先获取 target_dir >>>
+    # target_dir = get_target_directory(OUTPUT_DIR) # <--- 删除这一行
     print(f"使用 {MAX_WORKERS} 个线程开始并发下载...")
-    print(f"所有新文件将被下载到: '{target_dir}'")
+    print(f"文件将被自动下载到 '{OUTPUT_DIR}' 下的 batch_XXXX 目录中。")
 
     success_count = 0
     failed_count = 0
     
-    # 创建任务生成器
     task_generator = generate_tasks(INPUT_JSONL, completed_hashes)
     
     with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
         futures = []
         progress_bar = tqdm(total=total_to_download, desc="下载进度")
 
-        # 主循环：从生成器获取任务并提交，同时处理已完成的任务
         for record in task_generator:
-            # 当正在处理的 future 列表达到上限时，等待并处理一个已完成的任务，为新任务腾出空间
             if len(futures) >= MAX_FUTURES_IN_FLIGHT:
-                # as_completed 会返回最先完成的 future
                 done_future = next(concurrent.futures.as_completed(futures))
-                futures.remove(done_future) # 从列表中移除已完成的
+                futures.remove(done_future)
                 
-                # 处理结果
                 try:
                     status, _, _ = done_future.result()
                     if status == "success": success_count += 1
                     else: failed_count += 1
                 except Exception as e:
-                    # 这里的异常通常是任务本身无法预料的错误
                     log_failure("unknown_url", f"executor_error: {e}")
                     failed_count += 1
                 finally:
                     progress_bar.update(1)
                     progress_bar.set_postfix(success=success_count, failed=failed_count)
 
-            # 提交新任务
-            future = executor.submit(process_record, record, target_dir)
+            # <<< 核心修改 3：提交任务时，传递基础输出目录 OUTPUT_DIR >>>
+            # 而不是之前固定的 target_dir
+            future = executor.submit(process_record, record, OUTPUT_DIR)
             futures.append(future)
 
-        # --- 4. 处理剩余的 future ---
-        # 当生成器耗尽后，列表中可能还有未完成的任务
+        # --- 4. 处理剩余的 future (无变化) ---
         progress_bar.set_description("下载收尾")
         for future in concurrent.futures.as_completed(futures):
             try:
