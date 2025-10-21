@@ -1,4 +1,4 @@
-# download_warc.py (v3 - memory efficient)
+# download_warc.py (v4 - True Streaming & Memory Efficient)
 import os
 import json
 import hashlib
@@ -10,14 +10,18 @@ from tqdm import tqdm
 from requests.exceptions import RequestException, ChunkedEncodingError, ConnectionError, ReadTimeout
 
 # ========== 配置 ==========
-# <<< 关键修改：使用预处理过的、只包含200状态码的索引文件
 INPUT_JSONL = "/Volumes/T7/cc/guardian_index/guardian_index_200_only.jsonl"
 OUTPUT_DIR = "/Volumes/T7/cc/guardian_warc_segments"
 LOG_FILE = "/Volumes/T7/cc/guardian_warc_segments/download_failed.log"
 SUCCESS_LOG = "/Volumes/T7/cc/guardian_warc_segments/download_success.log"
 BASE_URL = "https://data.commoncrawl.org/"
-MAX_WORKERS = 16
+MAX_WORKERS = 64
 MAX_FILES_PER_DIR = 5000
+
+# <<< 新增配置：控制内存中的任务队列大小 >>>
+# 限制同时在内存中排队的任务数量，防止无限增长。
+# 一个好的经验值是最大工作线程数的几倍。
+MAX_FUTURES_IN_FLIGHT = MAX_WORKERS * 4
 
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
@@ -102,8 +106,31 @@ def process_record(record, target_dir):
         log_failure(url, error_message)
         return ("failed", url, error_message)
 
+# <<< 关键修改：将文件读取和过滤逻辑封装成一个生成器 >>>
+def generate_tasks(input_file, completed_hashes):
+    """
+    流式读取输入文件，跳过已完成的任务，并逐一产出（yield）需要处理的记录。
+    这个函数不会将所有记录加载到内存中。
+    """
+    try:
+        with open(input_file, "r", encoding="utf-8") as f:
+            for line in f:
+                try:
+                    record = json.loads(line)
+                    filename = safe_filename(record["url"])
+                    if filename in completed_hashes:
+                        continue # 直接跳到下一行
+                    yield record
+                except (json.JSONDecodeError, KeyError):
+                    # 跳过格式错误的行
+                    continue
+    except FileNotFoundError:
+        print(f"错误: 输入文件 '{input_file}' 未找到。")
+        print("请先运行 filter_jsonl.py 脚本生成此文件。")
+        return # 结束生成器
+
 def main():
-    # --- 加载已完成记录 (逻辑与之前类似，但更健壮) ---
+    # --- 1. 加载已完成记录 (这部分仍然需要加载到内存中，但通常是可控的) ---
     print("正在加载已完成的下载记录...")
     completed_hashes = set()
     try:
@@ -112,78 +139,95 @@ def main():
         print(f"从 '{SUCCESS_LOG}' 加载了 {len(completed_hashes)} 条记录。")
     except FileNotFoundError:
         print(f"成功日志 '{SUCCESS_LOG}' 未找到，将自动创建。")
-    
-    # 文件系统扫描依然可以作为补充，以防日志文件不完整
-    # (此部分逻辑与 v2 相同，这里省略以保持简洁)
 
-    # --- <<< 关键修改：流式读取和过滤，不一次性加载到内存 >>> ---
-    print("正在扫描索引文件并准备下载任务...")
-    records_to_process = []
-    skipped_exists_count = 0
+    # --- 2. 预先计算总任务数，以便显示准确的进度条 (快速扫描，低内存) ---
+    print("正在扫描索引文件以计算任务总数...")
     total_records_in_file = 0
-
+    total_to_download = 0
     try:
         with open(INPUT_JSONL, "r", encoding="utf-8") as f:
             for line in f:
                 total_records_in_file += 1
                 try:
-                    record = json.loads(line)
-                    filename = safe_filename(record["url"])
-                    if filename in completed_hashes:
-                        skipped_exists_count += 1
-                        continue
-                    records_to_process.append(record)
+                    # 只解析URL来检查是否已完成，比 json.loads(line) 更快
+                    url = json.loads(line).get("url")
+                    if url and safe_filename(url) not in completed_hashes:
+                        total_to_download += 1
                 except (json.JSONDecodeError, KeyError):
-                    # 跳过格式错误的行或没有 "url" 字段的记录
                     continue
     except FileNotFoundError:
-        print(f"错误: 输入文件 '{INPUT_JSONL}' 未找到。")
-        print("请先运行 filter_jsonl.py 脚本生成此文件。")
+        print(f"错误: 输入文件 '{INPUT_JSONL}' 未找到。程序即将退出。")
         return
 
     print(f"索引文件 '{INPUT_JSONL}' 中共有 {total_records_in_file} 条记录。")
+    print(f"已完成: {len(completed_hashes)} 条。")
+    print(f"预计需要下载: {total_to_download} 个新文件。")
 
-    # --- 后续逻辑与之前基本相同 ---
-    target_dir = get_target_directory(OUTPUT_DIR)
-    
-    total_to_download = len(records_to_process)
     if total_to_download == 0:
-        print("\n所有文件均已下载或被跳过，无需执行任何操作。")
-    else:
-        print(f"将要下载 {total_to_download} 个新文件。使用 {MAX_WORKERS} 个线程开始并发下载...")
-        print(f"所有新文件将被下载到: '{target_dir}'")
+        print("\n所有文件均已下载，无需执行任何操作。")
+        return
 
+    # --- 3. <<< 核心修改：流式处理和并发提交 >>> ---
+    target_dir = get_target_directory(OUTPUT_DIR)
+    print(f"使用 {MAX_WORKERS} 个线程开始并发下载...")
+    print(f"所有新文件将被下载到: '{target_dir}'")
 
     success_count = 0
     failed_count = 0
     
-    if total_to_download > 0:
-        with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-            # 这里的 future_to_record 字典会占用一些内存，但只包含待处理的任务，远小于整个文件
-            future_to_record = {executor.submit(process_record, record, target_dir): record for record in records_to_process}
-            progress_bar = tqdm(concurrent.futures.as_completed(future_to_record), total=total_to_download, desc="下载进度")
-            
-            for future in progress_bar:
+    # 创建任务生成器
+    task_generator = generate_tasks(INPUT_JSONL, completed_hashes)
+    
+    with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        futures = []
+        progress_bar = tqdm(total=total_to_download, desc="下载进度")
+
+        # 主循环：从生成器获取任务并提交，同时处理已完成的任务
+        for record in task_generator:
+            # 当正在处理的 future 列表达到上限时，等待并处理一个已完成的任务，为新任务腾出空间
+            if len(futures) >= MAX_FUTURES_IN_FLIGHT:
+                # as_completed 会返回最先完成的 future
+                done_future = next(concurrent.futures.as_completed(futures))
+                futures.remove(done_future) # 从列表中移除已完成的
+                
+                # 处理结果
                 try:
-                    status, _, _ = future.result()
-                    if status == "success":
-                        success_count += 1
-                    else:
-                        failed_count += 1
-                except Exception as exc:
-                    record = future_to_record[future]
-                    url = record.get('url', 'unknown_url')
-                    log_failure(url, f"executor_error: {exc}")
+                    status, _, _ = done_future.result()
+                    if status == "success": success_count += 1
+                    else: failed_count += 1
+                except Exception as e:
+                    # 这里的异常通常是任务本身无法预料的错误
+                    log_failure("unknown_url", f"executor_error: {e}")
                     failed_count += 1
                 finally:
-                     progress_bar.set_postfix(success=success_count, failed=failed_count)
+                    progress_bar.update(1)
+                    progress_bar.set_postfix(success=success_count, failed=failed_count)
 
+            # 提交新任务
+            future = executor.submit(process_record, record, target_dir)
+            futures.append(future)
+
+        # --- 4. 处理剩余的 future ---
+        # 当生成器耗尽后，列表中可能还有未完成的任务
+        progress_bar.set_description("下载收尾")
+        for future in concurrent.futures.as_completed(futures):
+            try:
+                status, _, _ = future.result()
+                if status == "success": success_count += 1
+                else: failed_count += 1
+            except Exception as e:
+                log_failure("unknown_url", f"executor_error: {e}")
+                failed_count += 1
+            finally:
+                progress_bar.update(1)
+                progress_bar.set_postfix(success=success_count, failed=failed_count)
+        
+        progress_bar.close()
 
     print("\n✅ 下载完成！")
     print("========== 结果统计 ==========")
     print(f"  本次成功下载: {success_count}")
-    print(f"  跳过 (已存在): {skipped_exists_count}")
-    # 因为已经预处理，所以不再有 "跳过 (非200状态)"
+    print(f"  已跳过 (之前已下载): {total_records_in_file - total_to_download}")
     print(f"  下载失败: {failed_count}")
     if failed_count > 0:
         print(f"  失败详情请查看日志文件: '{LOG_FILE}'")
