@@ -3,9 +3,9 @@ from tqdm import tqdm
 import json
 from urllib.parse import urlparse
 
-OUTPUT_DIR = "guardian_batches_part2"
-OUTPUT = "guardian_index_part2.jsonl"
-TEMP_MERGED = "guardian_index_partial.jsonl"
+OUTPUT_DIR = "/Volumes/T7/cc/guardian_index"
+OUTPUT = "/Volumes/T7/cc/guardian_index/guardian_index_all.jsonl"
+TEMP_MERGED = "/Volumes/T7/cc/guardian_index/guardian_index_partial.jsonl"
 BATCH_SIZE = 100  # 一次处理多少个文件，可根据内存调整
 
 def normalize_url(url: str) -> str:
@@ -54,7 +54,8 @@ def deduplicate_records(records, existing_map=None):
 
 def load_jsonl_file(file_path):
     records = []
-    with open(file_path, "r", encoding="utf-8") as f:
+    # with open(file_path, "r", encoding="utf-8") as f:
+    with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
         for line in f:
             try:
                 records.append(json.loads(line))
