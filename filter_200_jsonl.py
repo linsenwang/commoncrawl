@@ -3,10 +3,13 @@ import os
 from tqdm import tqdm
 
 # ========== 配置 ==========
-# 原始的、包含所有记录的索引文件
-SOURCE_JSONL = "/Volumes/T7/cc/guardian_index/guardian_index_all.jsonl" 
-# 清理后，只包含 status: "200" 记录的输出文件
-OUTPUT_JSONL = "/Volumes/T7/cc/guardian_index/guardian_index_200_only.jsonl"
+# # 原始的、包含所有记录的索引文件
+# SOURCE_JSONL = "/Volumes/T7/cc/guardian_index/guardian_index_all.jsonl" 
+# # 清理后，只包含 status: "200" 记录的输出文件
+# OUTPUT_JSONL = "/Volumes/T7/cc/guardian_index/guardian_index_200_only.jsonl"
+
+SOURCE_JSONL = "guardian_index_all.jsonl" 
+OUTPUT_JSONL = "guardian_index_200_only.jsonl"
 
 def count_lines(filename):
     """高效地计算文件行数，用于tqdm进度条。"""

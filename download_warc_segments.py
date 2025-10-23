@@ -9,13 +9,25 @@ import concurrent.futures
 from tqdm import tqdm
 from requests.exceptions import RequestException, ChunkedEncodingError, ConnectionError, ReadTimeout
 
+USE_T7 = False
+if USE_T7:
+    database_prefix = "/Volumes/T7/cc/"
+else:
+    database_prefix = "/Users/yangqian/Downloads/commoncrawl"
+
 # ========== 配置 (无变化) ==========
-INPUT_JSONL = "/Volumes/T7/cc/guardian_index/guardian_index_200_only.jsonl"
-OUTPUT_DIR = "/Volumes/T7/cc/guardian_warc_segments"
-LOG_FILE = "/Volumes/T7/cc/guardian_warc_segments/download_failed.log"
-SUCCESS_LOG = "/Volumes/T7/cc/guardian_warc_segments/download_success.log"
+# INPUT_JSONL = f"{database_prefix}/guardian_index/guardian_index_200_only.jsonl"
+# OUTPUT_DIR = f"{database_prefix}/guardian_warc_segments"
+# LOG_FILE = f"{database_prefix}/guardian_warc_segments/download_failed.log"
+# SUCCESS_LOG = f"{database_prefix}/guardian_warc_segments/download_success.log"
+
+INPUT_JSONL = f"{database_prefix}/guardian_index_sample_1000.jsonl"
+OUTPUT_DIR = f"{database_prefix}/sample_1000"
+LOG_FILE = f"{database_prefix}/sample_1000/download_failed.log"
+SUCCESS_LOG = f"{database_prefix}/sample_1000/download_success.log"
+
 BASE_URL = "https://data.commoncrawl.org/"
-MAX_WORKERS = 64
+MAX_WORKERS = 128
 MAX_FILES_PER_DIR = 5000
 MAX_FUTURES_IN_FLIGHT = MAX_WORKERS * 4
 
